@@ -177,6 +177,39 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "claude-telegram-bridge", cloudDevTriggerId: CLOUD_DEV_TRIGGER_ID });
 });
 
+// DEBUG TEMPORÁRIO — testar se um subagente (Task) consegue carregar/usar ferramentas
+// adiadas (deferred) como RemoteTrigger, ou só a thread principal consegue.
+app.get("/debug/probe-subagent-tool", async (req, res) => {
+  let finalText = "";
+  try {
+    for await (const message of query({
+      prompt: "Acione o subagente 'prober' pra fazer o teste.",
+      options: {
+        systemPrompt: "Você só aciona o subagente 'prober' via Task e devolve o resultado dele literalmente.",
+        agents: {
+          prober: {
+            description: "Testa se consegue usar RemoteTrigger.",
+            prompt: "Chame ToolSearch com query 'select:RemoteTrigger' pra carregar a ferramenta. Depois chame RemoteTrigger com action 'list'. Responda com o texto 'SUBAGENT_REMOTETRIGGER_OK' seguido da quantidade de triggers retornados, ou 'SUBAGENT_REMOTETRIGGER_FALHOU: <erro exato>' se der qualquer problema (incluindo se a ferramenta não aparecer disponível).",
+            tools: ["RemoteTrigger", "ToolSearch"],
+            maxTurns: 10,
+          },
+        },
+        permissionMode: "bypassPermissions",
+        maxTurns: 10,
+      },
+    })) {
+      if (message.type === "assistant" && !message.parent_tool_use_id && message.message?.content) {
+        for (const block of message.message.content) {
+          if ("text" in block) finalText += block.text;
+        }
+      }
+    }
+    res.type("text/plain").send(finalText || "(vazio)");
+  } catch (err) {
+    res.status(500).type("text/plain").send(String(err));
+  }
+});
+
 app.get("/telegram/:slug", (req, res) => {
   res.json({ ok: true, message: `Ponte Claude ativa para o projeto "${req.params.slug}".` });
 });
