@@ -307,7 +307,9 @@ async function askClaude({ systemPrompt, userText, sessionKey }) {
       console.log("[mcp status]", JSON.stringify(message.mcp_servers || message.mcpServers || {}));
       if (message.session_id) chatSessions.set(sessionKey, message.session_id);
     }
-    if (message.type === "assistant" && message.message?.content) {
+    // parent_tool_use_id != null significa que a mensagem veio de dentro de um subagente
+    // (analyst/dev/qa) — só queremos o texto que o orquestrador realmente devolve pro Rafael.
+    if (message.type === "assistant" && !message.parent_tool_use_id && message.message?.content) {
       for (const block of message.message.content) {
         if ("text" in block) {
           finalText += block.text;
@@ -319,18 +321,38 @@ async function askClaude({ systemPrompt, userText, sessionKey }) {
   return finalText || "Não consegui gerar uma resposta agora. Tenta reformular o pedido?";
 }
 
+const TELEGRAM_MAX_LENGTH = 4096;
+
+function splitForTelegram(text) {
+  if (text.length <= TELEGRAM_MAX_LENGTH) return [text];
+  const chunks = [];
+  let rest = text;
+  while (rest.length > TELEGRAM_MAX_LENGTH) {
+    let cut = rest.lastIndexOf("\n", TELEGRAM_MAX_LENGTH);
+    if (cut <= 0) cut = TELEGRAM_MAX_LENGTH;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+
 async function sendTelegramMessage({ botToken, chatId, text }) {
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
-  });
-  if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`Telegram error ${resp.status}: ${errText}`);
+  let lastResult;
+  for (const chunk of splitForTelegram(text)) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: chunk }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Telegram error ${resp.status}: ${errText}`);
+    }
+    lastResult = await resp.json();
   }
-  return resp.json();
+  return lastResult;
 }
 
 app.get("/", (req, res) => {
