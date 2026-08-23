@@ -4,10 +4,17 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 const app = express();
 app.use(express.json());
 
-const DEFAULT_SYSTEM_PROMPT = `Você é a porta de entrada de um pipeline de criação/alteração de sistemas por comando.
-Quando o usuário pedir algo, confirme o que entendeu em 1-2 frases, de forma objetiva e técnica.
-Pergunte apenas o essencial que faltar (nome do sistema, funcionalidades-chave), sem enrolação.
-Quando o pedido já estiver claro o suficiente para ser construído, termine sua resposta com a tag [PIPELINE_READY] em uma linha separada.
+const LOVABLE_WORKSPACE_ID = "aD4lGjRXiZsXfyXexOBi"; // Rafael's Lovable — NUNCA outro workspace, especialmente nunca OmniaConexa
+
+const DEFAULT_SYSTEM_PROMPT = `Você é o orquestrador do pipeline de criação/alteração de sistemas do Rafael, com acesso direto ao Lovable via MCP.
+
+Quando o Rafael pedir a criação ou alteração de um sistema:
+1. Confirme o que entendeu em 1-2 frases, de forma objetiva e técnica. Pergunte apenas o essencial que faltar (nome do sistema, funcionalidades-chave), sem enrolação.
+2. Assim que o pedido estiver claro o suficiente, use a ferramenta do Lovable para criar o projeto (create_project), sempre com workspace_id "${LOVABLE_WORKSPACE_ID}" — NUNCA use nenhum outro workspace, especialmente nunca o da OmniaConexa. Escreva uma mensagem inicial detalhada pro Lovable, descrevendo requisitos claros a partir do pedido do Rafael.
+3. Acompanhe a conclusão do projeto (get_message / get_project) até ter um preview_url pronto.
+4. Responda ao Rafael com o link de preview e um resumo curto (1-2 frases) do que foi construído.
+
+Se o pedido não for sobre construir/alterar um sistema (por exemplo, uma pergunta comum), apenas responda normalmente, sem acionar o Lovable.
 Nunca use listas, markdown pesado ou emojis — é uma conversa de chat comum.`;
 
 function loadProjects() {
@@ -25,10 +32,26 @@ async function askClaude({ systemPrompt, userText }) {
     prompt: userText,
     options: {
       systemPrompt: systemPrompt || DEFAULT_SYSTEM_PROMPT,
-      allowedTools: [],
-      permissionMode: "default",
+      mcpServers: {
+        lovable: {
+          type: "http",
+          url: "https://mcp.lovable.dev",
+        },
+      },
+      allowedTools: [
+        "mcp__lovable__create_project",
+        "mcp__lovable__send_message",
+        "mcp__lovable__get_message",
+        "mcp__lovable__get_project",
+        "mcp__lovable__list_projects",
+        "mcp__lovable__list_workspaces",
+      ],
+      permissionMode: "bypassPermissions",
     },
   })) {
+    if (message.type === "system" && message.subtype === "init") {
+      console.log("[mcp status]", JSON.stringify(message.mcp_servers || message.mcpServers || {}));
+    }
     if (message.type === "assistant" && message.message?.content) {
       for (const block of message.message.content) {
         if ("text" in block) {
@@ -91,8 +114,6 @@ app.post("/telegram/:slug", async (req, res) => {
   const chatId = message.chat.id;
   const userText = message.text;
 
-  // Responde ao Telegram imediatamente para não estourar o timeout do webhook;
-  // o processamento e a resposta de verdade seguem em background.
   res.status(200).json({ ok: true });
 
   try {
