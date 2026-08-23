@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 const app = express();
+app.set("trust proxy", 1); // Render fica atrás de proxy; sem isso req.protocol vira "http" e quebra o OAuth do Lovable
 app.use(express.json());
 
 const LOVABLE_WORKSPACE_ID = "aD4lGjRXiZsXfyXexOBi"; // Rafael's Lovable — NUNCA outro workspace, especialmente nunca OmniaConexa
