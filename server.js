@@ -359,6 +359,26 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "claude-telegram-bridge", lovableAuthorized: !!lovableAuth?.accessToken });
 });
 
+// DEBUG TEMPORÁRIO — remover depois de confirmar se o RemoteTrigger existe nesta sessão do SDK
+app.get("/debug/probe-tools", async (req, res) => {
+  let finalText = "";
+  try {
+    for await (const message of query({
+      prompt: "Liste, em texto puro sem markdown, TODOS os nomes de ferramentas que você tem disponíveis agora (incluindo MCP tools e ferramentas internas tipo RemoteTrigger, CronCreate, ScheduleWakeup, se existirem). Não execute nenhuma delas, só liste os nomes exatos. Se RemoteTrigger não existir, diga explicitamente 'RemoteTrigger NAO disponivel'.",
+      options: { permissionMode: "bypassPermissions", maxTurns: 3 },
+    })) {
+      if (message.type === "assistant" && !message.parent_tool_use_id && message.message?.content) {
+        for (const block of message.message.content) {
+          if ("text" in block) finalText += block.text;
+        }
+      }
+    }
+    res.type("text/plain").send(finalText || "(vazio)");
+  } catch (err) {
+    res.status(500).type("text/plain").send(String(err));
+  }
+});
+
 app.get("/telegram/:slug", (req, res) => {
   res.json({ ok: true, message: `Ponte Claude ativa para o projeto "${req.params.slug}".` });
 });
