@@ -7,25 +7,20 @@ Serviço persistente (Render) que responde no Telegram instantaneamente usando o
 Cada mensagem aciona um Orquestrador (tech lead + PO) que não tem acesso ao Lovable. Ele delega, via subagentes (`Task` tool), para:
 
 - **analyst**: transforma o pedido numa especificação técnica com critérios de aceite. Sem ferramentas externas.
-- **dev**: único agente com permissão de criar/alterar projetos no Lovable. Sempre usa o workspace fixo do Rafael.
-- **qa**: revisa o resultado do dev contra os critérios de aceite — só inspeciona, nunca escreve. Aprova ou reprova, e se reprovar o orquestrador aciona o dev de novo.
+- **dev**: único agente com acesso de escrita ao Lovable (`create_project`, `send_message`). Sempre usa o workspace fixo do Rafael. Se o Lovable não estiver autorizado, falha rápido com uma mensagem clara em vez de ficar tentando de novo.
+- **qa**: revisa o resultado do dev contra os critérios de aceite — só tem ferramentas de leitura no Lovable. Aprova ou reprova, e se reprovar o orquestrador aciona o dev de novo.
 
-O contexto da conversa é mantido por chat do Telegram (resume de sessão), então o orquestrador lembra do que já foi perguntado/decidido entre mensagens.
+O contexto da conversa é mantido por chat do Telegram (resume de sessão), então o orquestrador lembra do que já foi perguntado/decidido entre mensagens. Cada passo que o orquestrador responde vira uma mensagem separada no Telegram (não um bloco único no final).
 
 ### Como dev/qa acessam o Lovable
 
-O bot no Render não tem OAuth próprio com o Lovable — o Lovable não libera `client_id` de domínios não cadastrados (só clientes pré-aprovados como Cursor/Claude Desktop). Em vez disso, dev e qa acionam sob demanda uma **rotina de nuvem** (`dev-lovable-executor`, criada em claude.ai/code/routines) que já está autenticada no Lovable através dos conectores da conta do Rafael — os mesmos que o Cowork usa.
+Via OAuth direto (`/oauth/lovable/start`) — **ainda pendente**: o Lovable rejeita nosso `client_id` (erro `invalid_client`) porque não libera clientes de domínios não cadastrados, só integrações pré-aprovadas (Cursor, Claude Desktop, etc). Isso só se resolve com o suporte deles (`support@lovable.dev`) liberando nosso redirect (`https://claude-telegram-bridge.onrender.com/oauth/lovable/callback`) na allowlist, ou passando um `client_id` fixo.
 
-O mecanismo, via a ferramenta `RemoteTrigger`:
-1. `update` no trigger, sobrescrevendo a instrução da tarefa daquela execução.
-2. `run` pra disparar a rotina imediatamente (isso ignora o intervalo mínimo de 1h dos agendamentos por cron — só se aplica a disparos automáticos recorrentes, não a execuções sob demanda).
-3. Poll em `get_run_log` até a rotina terminar e devolver o resultado.
-
-Isso significa que qualquer subagente que precise de um conector já autorizado na conta do Rafael (Lovable, Supabase, etc.) pode usar o mesmo padrão — basta dar acesso às ferramentas `RemoteTrigger`/`ToolSearch` pra ele e seguir o mesmo passo a passo.
+> Testamos uma alternativa via `RemoteTrigger` (rotina de nuvem já autenticada no Lovable pelos conectores da conta) — funciona quando chamada por uma sessão interativa do claude.ai/Cowork, mas falha com `Unable to get organization UUID` quando chamada por um processo headless autenticado só com `CLAUDE_CODE_OAUTH_TOKEN`. Não é viável pra esse bot no estado atual.
 
 ## Variáveis de ambiente (Render → Environment)
 
-- `CLAUDE_CODE_OAUTH_TOKEN`: gerado com `claude setup-token` no seu computador. Esse mesmo token dá acesso à ferramenta `RemoteTrigger` dentro do agente.
+- `CLAUDE_CODE_OAUTH_TOKEN`: gerado com `claude setup-token` no seu computador.
 - `PROJECTS_CONFIG`: JSON com um objeto por bot/projeto:
 
 ```json
@@ -39,7 +34,9 @@ Isso significa que qualquer subagente que precise de um conector já autorizado 
 ]
 ```
 
-- `CLOUD_DEV_TRIGGER_ID` (opcional): ID da rotina `dev-lovable-executor` em claude.ai/code/routines. Tem um default fixo no código; só precisa setar se recriar a rotina.
+- `LOVABLE_ACCESS_TOKEN` / `LOVABLE_REFRESH_TOKEN`: preenchidos automaticamente após o login em `/oauth/lovable/start`. Não precisa setar na mão.
+- `RENDER_API_KEY` (opcional, mas recomendado): API key do Render (Account Settings → API Keys) com permissão de escrever env vars neste serviço. Sem ela, o token do Lovable fica só em memória e se perde a cada deploy/restart.
+- `RENDER_SERVICE_ID` (opcional): só necessário se o service ID mudar; hoje tem um default fixo pro serviço `claude-telegram-bridge`.
 
 ## Registrar o webhook no Telegram (uma vez por bot)
 

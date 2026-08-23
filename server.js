@@ -1,80 +1,49 @@
 import express from "express";
+import crypto from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 const app = express();
-app.set("trust proxy", 1); // Render fica atrás de proxy; sem isso req.protocol vira "http"
+app.set("trust proxy", 1); // Render fica atrás de proxy; sem isso req.protocol vira "http" e quebra o OAuth do Lovable
 app.use(express.json());
 
 const LOVABLE_WORKSPACE_ID = "aD4lGjRXiZsXfyXexOBi"; // Rafael's Lovable — NUNCA outro workspace, especialmente nunca OmniaConexa
+const LOVABLE_MCP_URL = "https://mcp.lovable.dev";
+const OAUTH_CALLBACK_PATH = "/oauth/lovable/callback";
 
-// Rotina de nuvem (Claude Code routine) já autenticada no Lovable via conectores da conta do
-// Rafael no claude.ai. O bot no Render não tem OAuth próprio com o Lovable (o Lovable não libera
-// client_id de domínios não cadastrados) — em vez disso, dev/qa acionam essa rotina sob demanda
-// via RemoteTrigger, que roda na nuvem já com o Lovable conectado.
-const CLOUD_DEV_TRIGGER_ID = process.env.CLOUD_DEV_TRIGGER_ID || "trig_014isDtyVyyMiiHK5Z7ktrMP";
-const CLOUD_ENVIRONMENT_ID = "env_015p7LpNAjL9bL3xMxFTqcKc";
+// Render API — usado só pra persistir os tokens do Lovable como env vars, assim eles
+// sobrevivem a redeploys e ao spin-down do plano free. Sem RENDER_API_KEY isso vira no-op
+// e os tokens ficam só em memória (perdidos no próximo deploy/restart).
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
+const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID || "srv-da5itvgu01pc73fdqvm0";
 
-const ORCHESTRATOR_PROMPT = `Você é o Orquestrador do pipeline de criação/alteração de sistemas do Rafael. Você é tech lead + PO: não escreve código nem mexe no Lovable diretamente. As ferramentas RemoteTrigger e mcp__lovable__* não estão disponíveis pra você — nunca tente usá-las, isso é trabalho do dev e do qa.
+const ORCHESTRATOR_PROMPT = `Você é o Orquestrador do pipeline de criação/alteração de sistemas do Rafael. Você é tech lead + PO: não escreve código nem mexe no Lovable diretamente. As ferramentas mcp__lovable__* não estão disponíveis pra você — nunca tente usá-las, isso é trabalho do dev e do qa.
 
 Fluxo:
 1. Ao receber um pedido, confirme o entendimento em 1-2 frases, de forma objetiva e técnica. Pergunte apenas o essencial que faltar (nome do sistema, funcionalidades-chave). Não prossiga até o pedido estar claro o suficiente.
 2. Quando estiver claro, acione o subagente "analyst" (ferramenta Task) pra transformar o pedido numa especificação técnica com critérios de aceite.
 3. Acione o subagente "dev" (Task) passando a especificação, pra criar ou alterar o projeto no Lovable.
-4. Acione o subagente "qa" (Task) passando os critérios de aceite e o que o dev retornou, pra validar o resultado.
-5. Se o QA reprovar, acione o dev de novo com os apontamentos e repita a validação. Se aprovar, siga pro passo 6.
-6. Responda ao Rafael com o link de preview e um resumo curto (1-2 frases) do que foi construído.
+4. Se o dev responder que o Lovable ainda não está autorizado (sem acesso configurado), não insista tentando de novo — repasse essa informação direto pro Rafael e pare o fluxo aqui.
+5. Acione o subagente "qa" (Task) passando os critérios de aceite e o que o dev retornou, pra validar o resultado.
+6. Se o QA reprovar, acione o dev de novo com os apontamentos e repita a validação. Se aprovar, siga pro passo 7.
+7. Responda ao Rafael com o link de preview e um resumo curto (1-2 frases) do que foi construído.
 
 Se o pedido não for sobre construir/alterar um sistema (por exemplo, uma pergunta comum), responda direto, sem acionar subagentes.
+Cada mensagem sua vira uma mensagem separada no Telegram — mande várias mensagens curtas em vez de uma só longa contando tudo de uma vez.
 Nunca use listas, markdown pesado ou emojis — é uma conversa de chat comum.`;
 
 const ANALYST_PROMPT = `Você é o Analista/Spec Writer do pipeline do Rafael. Recebe um pedido já confirmado pelo orquestrador e escreve uma especificação técnica objetiva: requisitos funcionais, principais telas/fluxos, e uma lista curta e clara de critérios de aceite (Definition of Done). Você não tem acesso a nenhuma ferramenta externa — devolva só a especificação em texto estruturado pro orquestrador repassar ao dev.`;
 
-// Template compartilhado por dev e qa pra acionar a rotina de nuvem sob demanda.
-function remoteTriggerInstructions({ allowedTools, taskFraming }) {
-  return `Você não tem acesso direto ao Lovable — mcp__lovable__* não existem aqui. O acesso acontece através de uma rotina na nuvem (Claude Code routine) já autenticada no Lovable via os conectores da conta do Rafael. Você aciona essa rotina sob demanda com a ferramenta RemoteTrigger. Se ela aparecer como "deferred"/sem schema carregado, chame primeiro ToolSearch com query "select:RemoteTrigger".
+const DEV_PROMPT = `Você é o Dev do pipeline do Rafael. Recebe uma especificação técnica e é o único agente com acesso de escrita ao Lovable. Use sempre workspace_id "${LOVABLE_WORKSPACE_ID}" — NUNCA use nenhum outro workspace, especialmente nunca o da OmniaConexa.
 
-ID da rotina: "${CLOUD_DEV_TRIGGER_ID}"
-Workspace fixo do Lovable: "${LOVABLE_WORKSPACE_ID}" — NUNCA use outro, especialmente nunca o da OmniaConexa.
+IMPORTANTE: se as ferramentas mcp__lovable__* não aparecerem disponíveis pra você, ou a primeira chamada falhar com erro de autenticação/autorização, NÃO insista tentando de novo — isso significa que o login do Lovable ainda não foi feito ou expirou. Responda imediatamente: "Lovable ainda não está autorizado — preciso que o Rafael refaça o login em /oauth/lovable/start" e pare, sem retry.
 
-${taskFraming}
+Se as ferramentas estiverem disponíveis: se ainda não existe projeto pra essa tarefa, crie com create_project e uma mensagem inicial detalhada baseada na especificação. Se já existe um projeto (o orquestrador vai indicar o project_id), use send_message pra aplicar as mudanças pedidas. Acompanhe com get_message/get_project até ter um preview_url pronto. Devolva ao orquestrador: preview_url, editor_url, project_id e um resumo curto do que foi implementado.`;
 
-Passo a passo pra cada tarefa:
-1. Monte em texto a instrução completa da tarefa pra rotina executar (${taskFraming.toLowerCase().includes("apenas inspecione") ? "só inspeção" : "criação/edição"} no Lovable), sempre citando o workspace_id acima.
-2. Chame RemoteTrigger action "update", trigger_id "${CLOUD_DEV_TRIGGER_ID}", body:
-{"job_config":{"ccr":{"environment_id":"${CLOUD_ENVIRONMENT_ID}","session_context":{"model":"claude-sonnet-5","allowed_tools":${JSON.stringify(allowedTools)}},"events":[{"data":{"uuid":"<gere um uuid v4 novo>","session_id":"","type":"user","parent_tool_use_id":null,"message":{"content":"<sua instrução completa da tarefa aqui>","role":"user"}}}]}}}
-3. Chame RemoteTrigger action "run", trigger_id "${CLOUD_DEV_TRIGGER_ID}". Guarde o session_id retornado.
-4. Chame RemoteTrigger action "get_run_log", session_id retornado. Se ainda não aparecer uma linha "result:", chame de novo — repita até no máximo ~20 vezes. Quando aparecer "result:", extraia o texto final que a rotina respondeu.
-5. Se depois de ~20 tentativas ainda não tiver terminado, diga que está demorando mais que o esperado em vez de ficar tentando pra sempre.`;
-}
+const QA_PROMPT = `Você é o QA/Revisor do pipeline do Rafael. Recebe os critérios de aceite e o resultado que o dev produziu no Lovable. Você só tem ferramentas de leitura no Lovable (get_project, get_message, list_projects) — nunca de escrita. Inspecione o projeto e compare com os critérios de aceite.
 
-const DEV_TOOLS_LOVABLE = [
-  "mcp__lovable__create_project",
-  "mcp__lovable__send_message",
-  "mcp__lovable__get_message",
-  "mcp__lovable__get_project",
-  "mcp__lovable__list_projects",
-  "mcp__lovable__list_workspaces",
-];
+Se as ferramentas mcp__lovable__* não estiverem disponíveis ou falharem por autenticação, não insista — responda "Lovable não autorizado, não dá pra revisar" e pare, sem retry.
 
-const QA_TOOLS_LOVABLE = ["mcp__lovable__get_project", "mcp__lovable__get_message", "mcp__lovable__list_projects"];
-
-const DEV_PROMPT = `Você é o Dev do pipeline do Rafael. Recebe uma especificação técnica e é o único agente com permissão de criar/alterar projetos no Lovable.
-
-${remoteTriggerInstructions({
-  allowedTools: DEV_TOOLS_LOVABLE,
-  taskFraming: "Se ainda não existe projeto pra essa tarefa, a instrução deve pedir create_project com uma mensagem inicial detalhada baseada na especificação. Se já existe um projeto (o orquestrador indica o project_id), a instrução deve pedir send_message com as mudanças. Em ambos os casos, peça pra confirmar com get_project/get_message até ter um preview_url pronto e devolver preview_url, editor_url, project_id e um resumo do que foi feito.",
-})}
-
-Devolva ao orquestrador exatamente o que a rotina respondeu (preview_url, editor_url, project_id) e um resumo curto do que foi implementado.`;
-
-const QA_PROMPT = `Você é o QA/Revisor do pipeline do Rafael. Recebe os critérios de aceite e o resultado que o dev produziu no Lovable.
-
-${remoteTriggerInstructions({
-  allowedTools: QA_TOOLS_LOVABLE,
-  taskFraming: "Sua instrução pra rotina deve pedir apenas inspecione o projeto (get_project/get_message/list_projects) e relate o que encontrou — nunca peça create_project nem send_message, você não tem permissão de escrita.",
-})}
-
-Compare o que a rotina relatou com os critérios de aceite. Responda com um veredito objetivo começando por APROVADO ou REPROVADO. Se reprovado, liste de forma curta e específica o que precisa ser corrigido para o orquestrador acionar o dev de novo.`;
+Responda com um veredito objetivo começando por APROVADO ou REPROVADO. Se reprovado, liste de forma curta e específica o que precisa ser corrigido para o orquestrador acionar o dev de novo.`;
 
 function loadProjects() {
   try {
@@ -84,59 +53,235 @@ function loadProjects() {
   }
 }
 
+function base64url(buf) {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const oauthState = new Map();
 // sessão do Claude por chat do Telegram, pra manter contexto entre mensagens (resume)
 const chatSessions = new Map();
 
-const AGENTS = {
-  analyst: {
-    description: "Escreve a especificação técnica e os critérios de aceite a partir de um pedido já confirmado.",
-    prompt: ANALYST_PROMPT,
-    tools: [],
-  },
-  dev: {
-    description: "Único agente com permissão de criar/alterar projetos no Lovable, via rotina de nuvem (RemoteTrigger).",
-    prompt: DEV_PROMPT,
-    tools: ["RemoteTrigger", "ToolSearch"],
-    maxTurns: 40, // update + run + várias tentativas de get_run_log até a rotina terminar
-  },
-  qa: {
-    description: "Revisa o que o dev construiu no Lovable contra os critérios de aceite; só inspeciona, nunca escreve.",
-    prompt: QA_PROMPT,
-    tools: ["RemoteTrigger", "ToolSearch"],
-    maxTurns: 40,
-  },
-};
-
-async function askClaude({ systemPrompt, userText, sessionKey }) {
-  let finalText = "";
-
-  const resumeSessionId = chatSessions.get(sessionKey);
-
-  for await (const message of query({
-    prompt: userText,
-    options: {
-      systemPrompt: systemPrompt || ORCHESTRATOR_PROMPT,
-      disallowedTools: ["mcp__lovable__*", "RemoteTrigger"],
-      agents: AGENTS,
-      permissionMode: "bypassPermissions",
-      resume: resumeSessionId,
-    },
-  })) {
-    if (message.type === "system" && message.subtype === "init") {
-      if (message.session_id) chatSessions.set(sessionKey, message.session_id);
+let lovableAuth = process.env.LOVABLE_ACCESS_TOKEN
+  ? {
+      accessToken: process.env.LOVABLE_ACCESS_TOKEN,
+      refreshToken: process.env.LOVABLE_REFRESH_TOKEN,
+      tokenEndpoint: null,
+      expiresAt: null, // desconhecido; só vamos descobrir no próximo refresh
     }
-    // parent_tool_use_id != null significa que a mensagem veio de dentro de um subagente
-    // (analyst/dev/qa) — só queremos o texto que o orquestrador realmente devolve pro Rafael.
-    if (message.type === "assistant" && !message.parent_tool_use_id && message.message?.content) {
-      for (const block of message.message.content) {
-        if ("text" in block) {
-          finalText += block.text;
-        }
+  : null;
+
+async function persistLovableTokens() {
+  if (!RENDER_API_KEY || !lovableAuth?.accessToken) return;
+  try {
+    const resp = await fetch(
+      `https://api.render.com/v1/services/${RENDER_SERVICE_ID}/env-vars`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${RENDER_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify([
+          { key: "LOVABLE_ACCESS_TOKEN", value: lovableAuth.accessToken },
+          { key: "LOVABLE_REFRESH_TOKEN", value: lovableAuth.refreshToken || "" },
+        ]),
       }
+    );
+    if (!resp.ok) {
+      console.error("[lovable] falha ao persistir tokens no Render:", resp.status, await resp.text());
+    } else {
+      console.log("[lovable] tokens persistidos no Render.");
     }
+  } catch (err) {
+    console.error("[lovable] erro ao persistir tokens no Render:", err);
+  }
+}
+
+async function discoverOAuthEndpoints() {
+  const prmResp = await fetch(`${LOVABLE_MCP_URL}/.well-known/oauth-protected-resource`);
+  if (!prmResp.ok) throw new Error(`protected-resource metadata: ${prmResp.status}`);
+  const prm = await prmResp.json();
+  const authServer = (prm.authorization_servers && prm.authorization_servers[0]) || LOVABLE_MCP_URL;
+
+  const asMetaResp = await fetch(`${authServer.replace(/\/$/, "")}/.well-known/oauth-authorization-server`);
+  if (!asMetaResp.ok) throw new Error(`authorization-server metadata: ${asMetaResp.status}`);
+  const asMeta = await asMetaResp.json();
+
+  return {
+    authorizationEndpoint: asMeta.authorization_endpoint,
+    tokenEndpoint: asMeta.token_endpoint,
+    registrationEndpoint: asMeta.registration_endpoint,
+  };
+}
+
+function clientMetadataUrl(req) {
+  return `${req.protocol}://${req.get("host")}/oauth/lovable/client-metadata.json`;
+}
+
+app.get("/oauth/lovable/client-metadata.json", (req, res) => {
+  const redirectUri = `${req.protocol}://${req.get("host")}${OAUTH_CALLBACK_PATH}`;
+  const clientId = clientMetadataUrl(req);
+  res.json({
+    client_id: clientId,
+    client_name: "claude-telegram-bridge",
+    redirect_uris: [redirectUri],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    application_type: "web",
+  });
+});
+
+app.get("/oauth/lovable/start", async (req, res) => {
+  try {
+    const { authorizationEndpoint, tokenEndpoint } = await discoverOAuthEndpoints();
+    const redirectUri = `${req.protocol}://${req.get("host")}${OAUTH_CALLBACK_PATH}`;
+    const clientId = clientMetadataUrl(req);
+
+    const codeVerifier = base64url(crypto.randomBytes(32));
+    const codeChallenge = base64url(crypto.createHash("sha256").update(codeVerifier).digest());
+    const state = base64url(crypto.randomBytes(16));
+
+    oauthState.set(state, { codeVerifier, tokenEndpoint, clientId, redirectUri });
+
+    const authUrl = new URL(authorizationEndpoint);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("client_id", clientId);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("code_challenge", codeChallenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+    authUrl.searchParams.set("state", state);
+
+    res.redirect(authUrl.toString());
+  } catch (err) {
+    console.error("[oauth start]", err);
+    res.status(500).send(`Erro ao iniciar login com o Lovable: ${err.message}`);
+  }
+});
+
+app.get(OAUTH_CALLBACK_PATH, async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.status(400).send(`Lovable recusou a autorização: ${error}`);
   }
 
-  return finalText || "Não consegui gerar uma resposta agora. Tenta reformular o pedido?";
+  const saved = oauthState.get(state);
+  if (!saved) {
+    return res.status(400).send("Estado inválido ou expirado. Tenta iniciar o login de novo em /oauth/lovable/start.");
+  }
+  oauthState.delete(state);
+
+  try {
+    const tokenResp = await fetch(saved.tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: saved.redirectUri,
+        client_id: saved.clientId,
+        code_verifier: saved.codeVerifier,
+      }),
+    });
+
+    if (!tokenResp.ok) {
+      const errText = await tokenResp.text();
+      throw new Error(`token exchange failed: ${tokenResp.status} ${errText}`);
+    }
+
+    const tokens = await tokenResp.json();
+    lovableAuth = {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+      tokenEndpoint: saved.tokenEndpoint,
+      expiresAt: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null,
+    };
+
+    console.log("[oauth] tokens obtidos, expira em", tokens.expires_in, "s");
+    await persistLovableTokens();
+
+    res.send("Login com o Lovable concluído. Pode fechar esta aba e voltar pro Telegram.");
+  } catch (err) {
+    console.error("[oauth callback]", err);
+    res.status(500).send(`Erro ao concluir login: ${err.message}`);
+  }
+});
+
+async function refreshLovableTokenIfNeeded() {
+  if (!lovableAuth?.refreshToken) return;
+
+  // se não sabemos quando expira (ex: veio de env var no boot), só espera dar 401 e tenta então
+  if (lovableAuth.expiresAt && Date.now() < lovableAuth.expiresAt - 60_000) return;
+
+  try {
+    const { tokenEndpoint } = lovableAuth.tokenEndpoint
+      ? { tokenEndpoint: lovableAuth.tokenEndpoint }
+      : await discoverOAuthEndpoints();
+
+    const resp = await fetch(tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: lovableAuth.refreshToken,
+      }),
+    });
+
+    if (!resp.ok) {
+      console.error("[lovable] refresh falhou:", resp.status, await resp.text());
+      return;
+    }
+
+    const tokens = await resp.json();
+    lovableAuth = {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token || lovableAuth.refreshToken,
+      tokenEndpoint,
+      expiresAt: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null,
+    };
+    console.log("[lovable] token renovado.");
+    await persistLovableTokens();
+  } catch (err) {
+    console.error("[lovable] erro ao renovar token:", err);
+  }
+}
+
+function buildAgents(mcpServers) {
+  const hasLovable = !!mcpServers.lovable;
+
+  return {
+    analyst: {
+      description: "Escreve a especificação técnica e os critérios de aceite a partir de um pedido já confirmado.",
+      prompt: ANALYST_PROMPT,
+      tools: [],
+    },
+    dev: {
+      description: "Único agente com acesso de escrita ao Lovable; cria/altera o projeto a partir da especificação.",
+      prompt: DEV_PROMPT,
+      tools: hasLovable
+        ? [
+            "mcp__lovable__create_project",
+            "mcp__lovable__send_message",
+            "mcp__lovable__get_message",
+            "mcp__lovable__get_project",
+            "mcp__lovable__list_projects",
+            "mcp__lovable__list_workspaces",
+          ]
+        : [],
+      mcpServers: hasLovable ? ["lovable"] : undefined,
+      maxTurns: 6, // pra reforçar o "não insista" — não deixa entrar em loop de retry
+    },
+    qa: {
+      description: "Revisa o que o dev construiu no Lovable contra os critérios de aceite; só lê, nunca escreve.",
+      prompt: QA_PROMPT,
+      tools: hasLovable
+        ? ["mcp__lovable__get_project", "mcp__lovable__get_message", "mcp__lovable__list_projects"]
+        : [],
+      mcpServers: hasLovable ? ["lovable"] : undefined,
+      maxTurns: 6,
+    },
+  };
 }
 
 const TELEGRAM_MAX_LENGTH = 4096;
@@ -159,6 +304,7 @@ async function sendTelegramMessage({ botToken, chatId, text }) {
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
   let lastResult;
   for (const chunk of splitForTelegram(text)) {
+    if (!chunk.trim()) continue;
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -173,41 +319,63 @@ async function sendTelegramMessage({ botToken, chatId, text }) {
   return lastResult;
 }
 
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "claude-telegram-bridge", cloudDevTriggerId: CLOUD_DEV_TRIGGER_ID });
-});
+// Processa o pedido e manda cada passo do orquestrador como uma mensagem separada no Telegram,
+// à medida que ele vai respondendo — em vez de acumular tudo num texto único no final.
+async function runPipeline({ systemPrompt, userText, sessionKey, botToken, chatId }) {
+  await refreshLovableTokenIfNeeded();
 
-// DEBUG TEMPORÁRIO — testar se um subagente (Task) consegue carregar/usar ferramentas
-// adiadas (deferred) como RemoteTrigger, ou só a thread principal consegue.
-app.get("/debug/probe-subagent-tool", async (req, res) => {
-  let finalText = "";
-  try {
-    for await (const message of query({
-      prompt: "Acione o subagente 'prober' pra fazer o teste.",
-      options: {
-        systemPrompt: "Você só aciona o subagente 'prober' via Task e devolve o resultado dele literalmente.",
-        agents: {
-          prober: {
-            description: "Testa se consegue usar RemoteTrigger.",
-            prompt: "Chame ToolSearch com query 'select:RemoteTrigger' pra carregar a ferramenta. Depois chame RemoteTrigger com action 'list'. Responda com o texto 'SUBAGENT_REMOTETRIGGER_OK' seguido da quantidade de triggers retornados, ou 'SUBAGENT_REMOTETRIGGER_FALHOU: <erro exato>' se der qualquer problema (incluindo se a ferramenta não aparecer disponível).",
-            tools: ["RemoteTrigger", "ToolSearch"],
-            maxTurns: 10,
-          },
-        },
-        permissionMode: "bypassPermissions",
-        maxTurns: 10,
-      },
-    })) {
-      if (message.type === "assistant" && !message.parent_tool_use_id && message.message?.content) {
-        for (const block of message.message.content) {
-          if ("text" in block) finalText += block.text;
-        }
+  const mcpServers = {};
+  if (lovableAuth?.accessToken) {
+    mcpServers.lovable = {
+      type: "http",
+      url: LOVABLE_MCP_URL,
+      headers: { Authorization: `Bearer ${lovableAuth.accessToken}` },
+    };
+  }
+
+  const resumeSessionId = chatSessions.get(sessionKey);
+  let sentAnything = false;
+
+  for await (const message of query({
+    prompt: userText,
+    options: {
+      systemPrompt: systemPrompt || ORCHESTRATOR_PROMPT,
+      mcpServers,
+      disallowedTools: ["mcp__lovable__*"],
+      agents: buildAgents(mcpServers),
+      permissionMode: "bypassPermissions",
+      resume: resumeSessionId,
+    },
+  })) {
+    if (message.type === "system" && message.subtype === "init") {
+      console.log("[mcp status]", JSON.stringify(message.mcp_servers || message.mcpServers || {}));
+      if (message.session_id) chatSessions.set(sessionKey, message.session_id);
+    }
+    // parent_tool_use_id != null significa que a mensagem veio de dentro de um subagente
+    // (analyst/dev/qa) — só mandamos pro Telegram o que o orquestrador realmente devolve pro Rafael.
+    if (message.type === "assistant" && !message.parent_tool_use_id && message.message?.content) {
+      let stepText = "";
+      for (const block of message.message.content) {
+        if ("text" in block) stepText += block.text;
+      }
+      if (stepText.trim()) {
+        await sendTelegramMessage({ botToken, chatId, text: stepText });
+        sentAnything = true;
       }
     }
-    res.type("text/plain").send(finalText || "(vazio)");
-  } catch (err) {
-    res.status(500).type("text/plain").send(String(err));
   }
+
+  if (!sentAnything) {
+    await sendTelegramMessage({
+      botToken,
+      chatId,
+      text: "Não consegui gerar uma resposta agora. Tenta reformular o pedido?",
+    });
+  }
+}
+
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "claude-telegram-bridge", lovableAuthorized: !!lovableAuth?.accessToken });
 });
 
 app.get("/telegram/:slug", (req, res) => {
@@ -245,12 +413,13 @@ app.post("/telegram/:slug", async (req, res) => {
   res.status(200).json({ ok: true });
 
   try {
-    const reply = await askClaude({
+    await runPipeline({
       systemPrompt: project.systemPrompt,
       userText,
       sessionKey: `${slug}:${chatId}`,
+      botToken: project.botToken,
+      chatId,
     });
-    await sendTelegramMessage({ botToken: project.botToken, chatId, text: reply });
   } catch (err) {
     console.error(`[${slug}]`, err);
     await sendTelegramMessage({
