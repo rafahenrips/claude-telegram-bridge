@@ -1,10 +1,13 @@
 import express from "express";
+import crypto from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 const app = express();
 app.use(express.json());
 
 const LOVABLE_WORKSPACE_ID = "aD4lGjRXiZsXfyXexOBi"; // Rafael's Lovable — NUNCA outro workspace, especialmente nunca OmniaConexa
+const LOVABLE_MCP_URL = "https://mcp.lovable.dev";
+const OAUTH_CALLBACK_PATH = "/oauth/lovable/callback";
 
 const DEFAULT_SYSTEM_PROMPT = `Você é o orquestrador do pipeline de criação/alteração de sistemas do Rafael, com acesso direto ao Lovable via MCP.
 
@@ -25,19 +28,140 @@ function loadProjects() {
   }
 }
 
+function base64url(buf) {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const oauthState = new Map();
+let lovableAuth = process.env.LOVABLE_ACCESS_TOKEN
+  ? { accessToken: process.env.LOVABLE_ACCESS_TOKEN, refreshToken: process.env.LOVABLE_REFRESH_TOKEN }
+  : null;
+
+async function discoverOAuthEndpoints() {
+  const prmResp = await fetch(`${LOVABLE_MCP_URL}/.well-known/oauth-protected-resource`);
+  if (!prmResp.ok) throw new Error(`protected-resource metadata: ${prmResp.status}`);
+  const prm = await prmResp.json();
+  const authServer = (prm.authorization_servers && prm.authorization_servers[0]) || LOVABLE_MCP_URL;
+
+  const asMetaResp = await fetch(`${authServer.replace(/\/$/, "")}/.well-known/oauth-authorization-server`);
+  if (!asMetaResp.ok) throw new Error(`authorization-server metadata: ${asMetaResp.status}`);
+  const asMeta = await asMetaResp.json();
+
+  return {
+    authorizationEndpoint: asMeta.authorization_endpoint,
+    tokenEndpoint: asMeta.token_endpoint,
+    registrationEndpoint: asMeta.registration_endpoint,
+  };
+}
+
+async function registerClient(registrationEndpoint, redirectUri) {
+  const resp = await fetch(registrationEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      redirect_uris: [redirectUri],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      client_name: "claude-telegram-bridge",
+    }),
+  });
+  if (!resp.ok) throw new Error(`dynamic client registration failed: ${resp.status} ${await resp.text()}`);
+  const data = await resp.json();
+  return data.client_id;
+}
+
+app.get("/oauth/lovable/start", async (req, res) => {
+  try {
+    const { authorizationEndpoint, tokenEndpoint, registrationEndpoint } = await discoverOAuthEndpoints();
+    const redirectUri = `${req.protocol}://${req.get("host")}${OAUTH_CALLBACK_PATH}`;
+    const clientId = await registerClient(registrationEndpoint, redirectUri);
+
+    const codeVerifier = base64url(crypto.randomBytes(32));
+    const codeChallenge = base64url(crypto.createHash("sha256").update(codeVerifier).digest());
+    const state = base64url(crypto.randomBytes(16));
+
+    oauthState.set(state, { codeVerifier, tokenEndpoint, clientId, redirectUri });
+
+    const authUrl = new URL(authorizationEndpoint);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("client_id", clientId);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("code_challenge", codeChallenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+    authUrl.searchParams.set("state", state);
+
+    res.redirect(authUrl.toString());
+  } catch (err) {
+    console.error("[oauth start]", err);
+    res.status(500).send(`Erro ao iniciar login com o Lovable: ${err.message}`);
+  }
+});
+
+app.get(OAUTH_CALLBACK_PATH, async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.status(400).send(`Lovable recusou a autorização: ${error}`);
+  }
+
+  const saved = oauthState.get(state);
+  if (!saved) {
+    return res.status(400).send("Estado inválido ou expirado. Tenta iniciar o login de novo em /oauth/lovable/start.");
+  }
+  oauthState.delete(state);
+
+  try {
+    const tokenResp = await fetch(saved.tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: saved.redirectUri,
+        client_id: saved.clientId,
+        code_verifier: saved.codeVerifier,
+      }),
+    });
+
+    if (!tokenResp.ok) {
+      const errText = await tokenResp.text();
+      throw new Error(`token exchange failed: ${tokenResp.status} ${errText}`);
+    }
+
+    const tokens = await tokenResp.json();
+    lovableAuth = { accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+
+    console.log("[oauth] tokens obtidos:", JSON.stringify({
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expires_in: tokens.expires_in,
+    }));
+
+    res.send("Login com o Lovable concluído. Pode fechar esta aba e voltar pro Telegram.");
+  } catch (err) {
+    console.error("[oauth callback]", err);
+    res.status(500).send(`Erro ao concluir login: ${err.message}`);
+  }
+});
+
 async function askClaude({ systemPrompt, userText }) {
   let finalText = "";
+
+  const mcpServers = {};
+  if (lovableAuth?.accessToken) {
+    mcpServers.lovable = {
+      type: "http",
+      url: LOVABLE_MCP_URL,
+      headers: { Authorization: `Bearer ${lovableAuth.accessToken}` },
+    };
+  }
 
   for await (const message of query({
     prompt: userText,
     options: {
       systemPrompt: systemPrompt || DEFAULT_SYSTEM_PROMPT,
-      mcpServers: {
-        lovable: {
-          type: "http",
-          url: "https://mcp.lovable.dev",
-        },
-      },
+      mcpServers,
       allowedTools: [
         "mcp__lovable__create_project",
         "mcp__lovable__send_message",
@@ -79,7 +203,7 @@ async function sendTelegramMessage({ botToken, chatId, text }) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "claude-telegram-bridge" });
+  res.json({ ok: true, service: "claude-telegram-bridge", lovableAuthorized: !!lovableAuth?.accessToken });
 });
 
 app.get("/telegram/:slug", (req, res) => {
