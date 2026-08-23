@@ -71,11 +71,29 @@ async function registerClient(registrationEndpoint, redirectUri) {
   return data.client_id;
 }
 
+function clientMetadataUrl(req) {
+  return `${req.protocol}://${req.get("host")}/oauth/lovable/client-metadata.json`;
+}
+
+app.get("/oauth/lovable/client-metadata.json", (req, res) => {
+  const redirectUri = `${req.protocol}://${req.get("host")}${OAUTH_CALLBACK_PATH}`;
+  const clientId = clientMetadataUrl(req);
+  res.json({
+    client_id: clientId,
+    client_name: "claude-telegram-bridge",
+    redirect_uris: [redirectUri],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    application_type: "web",
+  });
+});
+
 app.get("/oauth/lovable/start", async (req, res) => {
   try {
-    const { authorizationEndpoint, tokenEndpoint, registrationEndpoint } = await discoverOAuthEndpoints();
+    const { authorizationEndpoint, tokenEndpoint } = await discoverOAuthEndpoints();
     const redirectUri = `${req.protocol}://${req.get("host")}${OAUTH_CALLBACK_PATH}`;
-    const clientId = await registerClient(registrationEndpoint, redirectUri);
+    const clientId = clientMetadataUrl(req);
 
     const codeVerifier = base64url(crypto.randomBytes(32));
     const codeChallenge = base64url(crypto.createHash("sha256").update(codeVerifier).digest());
